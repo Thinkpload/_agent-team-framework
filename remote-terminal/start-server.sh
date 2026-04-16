@@ -17,10 +17,38 @@ RT_USER="${RT_USER:-admin}"
 RT_PASS="${RT_PASS:-changeme123}"
 RT_SESSION="${RT_SESSION:-claude-remote}"
 RT_WORKDIR="${RT_WORKDIR:-$HOME}"
-RT_TLS="${RT_TLS:-0}"
+RT_BIND_TAILSCALE="${RT_BIND_TAILSCALE:-1}"
 
 # Expand tilde in workdir
 RT_WORKDIR="${RT_WORKDIR/#\~/$HOME}"
+
+# ── Resolve bind address ──────────────────────────────────────────────────────
+BIND_ADDR="0.0.0.0"
+TS_IP=""
+TS_HOST=""
+
+if [[ "$RT_BIND_TAILSCALE" == "1" ]]; then
+    if ! command -v tailscale &>/dev/null; then
+        echo "ERROR: tailscale not found but RT_BIND_TAILSCALE=1." >&2
+        echo "Install Tailscale or set RT_BIND_TAILSCALE=0 in config.env." >&2
+        exit 1
+    fi
+    if ! tailscale status &>/dev/null; then
+        echo "ERROR: Tailscale is not connected. Run: sudo tailscale up" >&2
+        exit 1
+    fi
+    TS_IP="$(tailscale ip -4 2>/dev/null | head -1)"
+    if [[ -z "$TS_IP" ]]; then
+        echo "ERROR: Could not get Tailscale IP. Is Tailscale running?" >&2
+        exit 1
+    fi
+    # MagicDNS hostname (strip trailing dot if present)
+    TS_HOST="$(tailscale status --json 2>/dev/null \
+        | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['Self']['DNSName'].rstrip('.'))" \
+        2>/dev/null || echo "")"
+    BIND_ADDR="$TS_IP"
+    echo "✓ Tailscale IP: $TS_IP${TS_HOST:+  MagicDNS: $TS_HOST}"
+fi
 
 # ── Dependency check ──────────────────────────────────────────────────────────
 for cmd in tmux ttyd; do
@@ -58,27 +86,9 @@ TTYD_ARGS=(
     --credential "${RT_USER}:${RT_PASS}"
     --writable
     --once=false
-    --interface 0.0.0.0
+    --interface "$BIND_ADDR"
+    --terminal-type xterm-256color
 )
-
-# Mobile-friendly font and xterm settings
-TTYD_ARGS+=(--terminal-type xterm-256color)
-TTYD_ARGS+=(--index /dev/null)   # use built-in xterm.js UI
-
-# TLS (self-signed) for external HTTPS access
-if [[ "$RT_TLS" == "1" ]]; then
-    CERT_DIR="$SCRIPT_DIR/.certs"
-    mkdir -p "$CERT_DIR"
-    if [[ ! -f "$CERT_DIR/server.crt" ]]; then
-        echo "Generating self-signed TLS certificate..."
-        openssl req -x509 -nodes -newkey rsa:2048 \
-            -keyout "$CERT_DIR/server.key" \
-            -out "$CERT_DIR/server.crt" \
-            -days 3650 \
-            -subj "/CN=claude-remote" 2>/dev/null
-    fi
-    TTYD_ARGS+=(--ssl --ssl-cert "$CERT_DIR/server.crt" --ssl-key "$CERT_DIR/server.key")
-fi
 
 TTYD_CMD=(tmux attach-session -t "$RT_SESSION")
 
@@ -96,28 +106,29 @@ if ! kill -0 "$TTYD_PID" 2>/dev/null; then
 fi
 
 # ── Print access info ─────────────────────────────────────────────────────────
-PROTO="http"
-[[ "$RT_TLS" == "1" ]] && PROTO="https"
-
-LOCAL_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || echo "YOUR_PC_IP")"
-
 echo ""
 echo "════════════════════════════════════════════════"
 echo " Claude Code Remote Terminal is running!"
 echo "════════════════════════════════════════════════"
 echo ""
-echo " Local network (same WiFi):"
-echo "   ${PROTO}://${LOCAL_IP}:${RT_PORT}"
+if [[ -n "$TS_IP" ]]; then
+    echo " Tailscale (from Android — open in Chrome):"
+    echo "   http://${TS_IP}:${RT_PORT}"
+    if [[ -n "$TS_HOST" ]]; then
+        echo "   http://${TS_HOST}:${RT_PORT}   (MagicDNS)"
+    fi
+    echo ""
+    echo "   Traffic is encrypted by WireGuard — no TLS needed."
+else
+    LOCAL_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || echo "YOUR_PC_IP")"
+    echo " Local network:"
+    echo "   http://${LOCAL_IP}:${RT_PORT}"
+fi
 echo ""
 echo " Login:"
 echo "   User: ${RT_USER}"
 echo "   Pass: ${RT_PASS}"
 echo ""
-if [[ -n "${RT_PUBLIC_URL:-}" ]]; then
-    echo " Public URL (Tailscale/ngrok):"
-    echo "   ${RT_PUBLIC_URL}"
-    echo ""
-fi
 echo " tmux session: $RT_SESSION"
 echo " ttyd PID: $TTYD_PID  (log: $SCRIPT_DIR/ttyd.log)"
 echo ""
